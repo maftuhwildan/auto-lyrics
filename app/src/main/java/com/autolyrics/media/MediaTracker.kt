@@ -88,6 +88,8 @@ class MediaTracker private constructor(context: Context) {
     private val trackChangeRunnable = Runnable {
         val track = pendingTrack ?: return@Runnable
         val art = pendingArt
+        pendingTrack = null
+        pendingArt = null
         val current = _state.value.track
         if (track == current) return@Runnable
 
@@ -188,12 +190,28 @@ class MediaTracker private constructor(context: Context) {
     }
 
     fun onMediaSessionChanged(controller: MediaController?) {
+        val current = activeController
+        if (controller == null && current == null) return
+        if (controller != null && current != null &&
+            controller.sessionToken == current.sessionToken
+        ) {
+            // Notification/session-list callbacks are frequent. Keep our callback
+            // registered and refresh the snapshot in case metadata changed before
+            // the framework delivered its callback.
+            handleMetadataChanged(controller.metadata)
+            handlePlaybackStateChanged(controller.playbackState)
+            return
+        }
+        // A delayed metadata change belongs to the previous media session and
+        // must never be committed after the controller has been replaced.
+        handler.removeCallbacks(trackChangeRunnable)
+        pendingTrack = null
+        pendingArt = null
         activeController?.unregisterCallback(mediaCallback)
         activeController = controller
 
         if (controller == null) {
             handler.removeCallbacks(positionChecker)
-            handler.removeCallbacks(trackChangeRunnable)
             artJob?.cancel()
             _state.value = LyricsState(offsetMs = lyricsOffsetMs)
             return
@@ -253,10 +271,23 @@ class MediaTracker private constructor(context: Context) {
         val current = _state.value.track
 
         if (current != null && newTrack == current) {
+            // Metadata may briefly report an intermediate item while a player is
+            // transitioning. If it settles back to the current item, discard the
+            // delayed transition rather than switching to stale pending metadata.
+            handler.removeCallbacks(trackChangeRunnable)
+            pendingTrack = null
+            pendingArt = null
             if (art != null && _state.value.albumArt == null) {
                 _state.value = _state.value.copy(albumArt = art)
                 extractAlbumColors(art)
             }
+            return
+        }
+
+        if (pendingTrack == newTrack) {
+            // Repeated active-session/notification callbacks often carry the
+            // same incoming metadata. Preserve the original debounce deadline.
+            if (art != null) pendingArt = art
             return
         }
 

@@ -49,8 +49,8 @@ android {
         applicationId = "com.autolyrics"
         minSdk = 26
         targetSdk = 34
-        versionCode = 39
-        versionName = "1.13.0"
+        versionCode = 40
+        versionName = "2.0"
 
         buildConfigField(
             "String",

@@ -119,6 +119,62 @@ internal object NowPlayingText {
         return chunkWords(tokens, budget).map { joinRange(tokens, it) }
     }
 
+    /** Split a display line at whitespace where possible without rejoining its text. */
+    fun chunkDisplayText(text: String, budget: Int): List<String> {
+        if (text.isBlank() || budget <= 0) return emptyList()
+        val matches = Regex("\\S+").findAll(text).toList()
+        if (matches.isEmpty()) return emptyList()
+
+        val chunks = mutableListOf<String>()
+        var start = -1
+        var end = -1
+        var width = 0
+
+        fun flush() {
+            if (start >= 0 && end > start) chunks.add(text.substring(start, end))
+            start = -1
+            end = -1
+            width = 0
+        }
+
+        for (match in matches) {
+            val token = match.value
+            val tokenWidth = displayWidth(token)
+            if (tokenWidth > budget) {
+                flush()
+                val part = StringBuilder()
+                var partWidth = 0
+                var offset = 0
+                while (offset < token.length) {
+                    val cp = token.codePointAt(offset)
+                    val cpWidth = charWidth(cp)
+                    if (partWidth + cpWidth > budget && part.isNotEmpty()) {
+                        chunks.add(part.toString())
+                        part.setLength(0)
+                        partWidth = 0
+                    }
+                    part.appendCodePoint(cp)
+                    partWidth += cpWidth
+                    offset += Character.charCount(cp)
+                }
+                if (part.isNotEmpty()) chunks.add(part.toString())
+                continue
+            }
+
+            val gapWidth = if (end >= 0) displayWidth(text.substring(end, match.range.first)) else 0
+            if (start >= 0 && width + gapWidth + tokenWidth > budget) flush()
+            if (start < 0) {
+                start = match.range.first
+                width = tokenWidth
+            } else {
+                width += gapWidth + tokenWidth
+            }
+            end = match.range.last + 1
+        }
+        flush()
+        return chunks
+    }
+
     fun joinRange(tokens: List<String>, range: IntRange): String =
         tokens.subList(range.first, range.last + 1).joinToString(" ")
 

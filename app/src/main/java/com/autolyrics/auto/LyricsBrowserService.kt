@@ -7,6 +7,7 @@ import android.media.session.PlaybackState
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.support.v4.media.MediaBrowserCompat
 import android.support.v4.media.MediaDescriptionCompat
 import android.support.v4.media.MediaMetadataCompat
@@ -46,9 +47,12 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
     private var aaKaraokeEnabled = true
     private var aaOffsetMs = 0L
 
-    private var lastKaraokeLineIdx = -1
-    private var lastKaraokeWordIdx = -1
-    private var lastKaraokeText: String? = null
+    // Separate karaoke caches: browse tree (600ms window) vs now-playing title (300ms window).
+    private val browseKaraoke = KaraokeBracketState()
+    private val nowPlayingKaraoke = KaraokeBracketState()
+    private val titleChunkHold = ChunkHold(MIN_CHUNK_DISPLAY_MS)
+    private val translationChunkHold = ChunkHold(MIN_CHUNK_DISPLAY_MS)
+    private var lastLyricTitle: String? = null
 
     private val prefsListener =
         SharedPreferences.OnSharedPreferenceChangeListener { sp, key ->
@@ -88,6 +92,19 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
         private const val NOTIFY_THROTTLE_MS = 500L
         private const val SESSION_REFRESH_MS = 1500L
         private const val PLAIN_LOOP_DELAY_MS = 2000L
+
+        // Now-playing card width budgets, in display units (1 per Latin char, 2 per
+        // fullwidth/CJK char incl. ??). These are estimates: calibrate on the head unit.
+        // Title uses a larger font than subtitle, so it fits less.
+        private const val TITLE_MAX_WIDTH = 28
+        private const val SUBTITLE_MAX_WIDTH = 32
+        // Minimum time an estimated (non-ELRC) chunk stays up before the next one, to avoid flicker.
+        private const val MIN_CHUNK_DISPLAY_MS = 1000L
+        // Assumed duration of the last synced line when the track duration is unknown.
+        private const val DEFAULT_LAST_LINE_MS = 5000L
+        // Karaoke bracket look-ahead window for browse tree (larger) vs now-playing title (smaller).
+        private const val BROWSE_KARAOKE_WINDOW_MS = 600L
+        private const val TITLE_KARAOKE_WINDOW_MS = 300L
     }
 
     override fun onCreate() {
@@ -535,28 +552,136 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
         return idx
     }
 
-    private fun buildKaraokeText(line: LyricLine, lineIdx: Int, posMs: Long): String {
-        val words = line.words
-        if (words.isEmpty()) return line.text
+    /** Whole-line karaoke text for the browse tree (uses its own cache, 600ms window). */
+    private fun buildKaraokeText(line: LyricLine, lineIdx: Int, posMs: Long): String =
+        browseKaraoke.build(
+            line.words, lineIdx, line.words.indices, posMs, BROWSE_KARAOKE_WINDOW_MS, line.text
+        )
 
-        val currentIdx = KaraokeTiming.activeWordIndex(words, posMs)
-        if (currentIdx < 0) return line.text
-
-        val sameLine = lineIdx == lastKaraokeLineIdx
-        if (sameLine && currentIdx == lastKaraokeWordIdx && lastKaraokeText != null) {
-            return lastKaraokeText!!
-        }
-
-        lastKaraokeLineIdx = lineIdx
-        lastKaraokeWordIdx = currentIdx
-        lastKaraokeText = LyricWordLayout.karaokeText(line, currentIdx)
-        return lastKaraokeText!!
+    /** Browse-tree karaoke cache; reset on track change and forced refresh. */
+    private fun resetKaraokeState() {
+        browseKaraoke.reset()
     }
 
-    private fun resetKaraokeState() {
-        lastKaraokeLineIdx = -1
-        lastKaraokeWordIdx = -1
-        lastKaraokeText = null
+    /** Now-playing card karaoke/chunk state; reset on track change and forced refresh. */
+    private fun resetNowPlayingState() {
+        nowPlayingKaraoke.reset()
+        titleChunkHold.reset()
+        translationChunkHold.reset()
+        lastLyricTitle = null
+    }
+
+    private class CardText(val lyricTitle: String?, val subtitle: String)
+
+    /**
+     * Text for the now-playing card.
+     *
+     * While a lyric line is active: DISPLAY_TITLE = the line being sung (karaoke 【】 only
+     * here), DISPLAY_SUBTITLE = what comes next (see [NowPlayingText.subtitleFor]).
+     * Otherwise (intro before the first timed line, loading, not found, error)
+     * [CardText.lyricTitle] is null so the title stays "Title — Artist", and the subtitle
+     * is the status text.
+     */
+    private fun getCardText(state: LyricsState): CardText {
+        getLyricCardText(state)?.let { return it }
+
+        val subtitle = when (state.status) {
+            // Intro: preview the first line while the title still shows the track.
+            LyricsStatus.FOUND -> state.lines.firstOrNull()?.text.orEmpty()
+            LyricsStatus.LOADING -> "Loading lyrics…"
+            LyricsStatus.NOT_FOUND -> "No lyrics found"
+            LyricsStatus.ERROR -> "Error loading lyrics"
+            else -> ""
+        }
+        return CardText(null, subtitle)
+    }
+
+    private fun getLyricCardText(state: LyricsState): CardText? {
+        val lines = state.lines
+        if (lines.isEmpty()) return null
+        val posMs = getAaPositionMs()
+        val durationMs = state.track?.durationMs ?: 0L
+
+        val idx: Int
+        val startMs: Long
+        val endMs: Long
+        when (state.status) {
+            LyricsStatus.FOUND -> {
+                idx = findLineIndex(lines, posMs)
+                if (idx < 0) return null
+                startMs = lines[idx].timeMs
+                val next = lines.getOrNull(idx + 1)?.timeMs
+                endMs = when {
+                    next != null && next > startMs -> next
+                    next == null && durationMs > startMs -> durationMs
+                    else -> startMs + DEFAULT_LAST_LINE_MS
+                }
+            }
+            LyricsStatus.PLAIN_ONLY -> {
+                // Unsynced: same estimated index as before, each line gets an equal time slice.
+                idx = if (durationMs > 0) {
+                    ((posMs.toFloat() / durationMs) * lines.size).toInt()
+                        .coerceIn(0, lines.size - 1)
+                } else 0
+                if (durationMs > 0) {
+                    startMs = durationMs * idx / lines.size
+                    endMs = durationMs * (idx + 1) / lines.size
+                } else {
+                    startMs = 0L
+                    endMs = DEFAULT_LAST_LINE_MS
+                }
+            }
+            else -> return null
+        }
+
+        val line = lines[idx]
+        val nextText = lines.getOrNull(idx + 1)?.text
+        val nowMs = SystemClock.elapsedRealtime()
+
+        // A translation of the current line takes the subtitle instead of the next line.
+        val translation = state.translatedLines?.getOrNull(idx)?.takeIf { it.isNotBlank() }
+        val translationChunk = translation?.let {
+            val chunks = NowPlayingText.chunkText(it, SUBTITLE_MAX_WIDTH)
+            if (chunks.isEmpty()) return@let null
+            val candidate = NowPlayingText.activeChunkByProportion(
+                chunks.map(NowPlayingText::displayWidth), startMs, endMs, posMs
+            )
+            chunks[translationChunkHold.select(idx, candidate, nowMs).coerceIn(0, chunks.lastIndex)]
+        }
+
+        val hasWords = line.words.isNotEmpty()
+        val useKaraoke = aaKaraokeEnabled && hasWords
+        // Reserve room for 【】 so the active chunk still fits with brackets.
+        val budget = if (useKaraoke) TITLE_MAX_WIDTH - NowPlayingText.KARAOKE_BRACKETS_WIDTH else TITLE_MAX_WIDTH
+        val tokens = if (hasWords) line.words.map { it.text } else NowPlayingText.tokenize(line.text, budget)
+        if (tokens.isEmpty()) {
+            return CardText(
+                NowPlayingText.END_MARK,
+                NowPlayingText.subtitleFor(emptyList(), 0, translationChunk, nextText)
+            )
+        }
+
+        val chunks = NowPlayingText.chunkWords(tokens, budget)
+        val chunkTexts = chunks.map { NowPlayingText.joinRange(tokens, it) }
+        val selectedChunk = if (hasWords) {
+            // ELRC: follow the sung word directly (no hold) so it is always in the title.
+            NowPlayingText.activeChunkByWordTime(chunks, NowPlayingText.currentWordIndex(line.words, posMs))
+        } else {
+            val candidate = NowPlayingText.activeChunkByProportion(
+                chunkTexts.map(NowPlayingText::displayWidth), startMs, endMs, posMs
+            )
+            titleChunkHold.select(idx, candidate, nowMs)
+        }
+        val chunkIdx = selectedChunk.coerceIn(0, chunks.lastIndex)
+
+        val title = if (useKaraoke) {
+            nowPlayingKaraoke.build(
+                line.words, idx, chunks[chunkIdx], posMs, TITLE_KARAOKE_WINDOW_MS, chunkTexts[chunkIdx]
+            )
+        } else {
+            chunkTexts[chunkIdx]
+        }
+        return CardText(title, NowPlayingText.subtitleFor(chunkTexts, chunkIdx, translationChunk, nextText))
     }
 
     private fun getSubtitleText(state: LyricsState): String {
@@ -599,7 +724,7 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
 
     // --- MediaSession management ---
 
-    private fun buildBaseMetadata(state: LyricsState): MediaMetadataCompat.Builder {
+    private fun buildBaseMetadata(state: LyricsState, lyricTitle: String? = null): MediaMetadataCompat.Builder {
         val metaBuilder = MediaMetadataCompat.Builder()
 
         state.track?.let { track ->
@@ -610,7 +735,7 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
                 metaBuilder.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, track.durationMs)
             }
 
-            val displayTitle = if (track.artist.isNotBlank()) {
+            val displayTitle = lyricTitle ?: if (track.artist.isNotBlank()) {
                 "${track.title} — ${track.artist}"
             } else {
                 track.title
@@ -656,11 +781,14 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
         if (!state.isPlaying) return
         if (state.status != LyricsStatus.FOUND && state.status != LyricsStatus.PLAIN_ONLY) return
 
-        val subtitleText = getSubtitleText(state)
-        if (subtitleText == lastSubtitleText) return
+        // Push only when the title or subtitle text actually changed.
+        val card = getCardText(state)
+        val subtitleText = card.subtitle
+        if (subtitleText == lastSubtitleText && card.lyricTitle == lastLyricTitle) return
         lastSubtitleText = subtitleText
+        lastLyricTitle = card.lyricTitle
 
-        val metaBuilder = buildBaseMetadata(state)
+        val metaBuilder = buildBaseMetadata(state, card.lyricTitle)
         if (subtitleText.isNotBlank()) {
             metaBuilder.putString(
                 MediaMetadataCompat.METADATA_KEY_DISPLAY_SUBTITLE,
@@ -745,6 +873,7 @@ class LyricsBrowserService : MediaBrowserServiceCompat() {
         displayedHasTranslation = false
         lastNotifyTime = 0L
         resetKaraokeState()
+        resetNowPlayingState()
         notifyBrowseSections()
     }
 

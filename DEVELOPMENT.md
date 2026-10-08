@@ -395,6 +395,30 @@ Other relevant constants:
 | `SESSION_REFRESH_MS` | 1500 ms |
 | `PLAIN_LOOP_DELAY_MS` | 2000 ms |
 
+## Now-playing Card Text
+
+The Android Auto now-playing card shows the current lyric in DISPLAY_TITLE and what follows in DISPLAY_SUBTITLE. Long lines are chunked at word boundaries to fit width budgets.
+
+| Constant | Value | Purpose |
+|---|---:|---|
+| TITLE_MAX_WIDTH | 28 | Max display width for DISPLAY_TITLE (Title font is larger) |
+| SUBTITLE_MAX_WIDTH | 32 | Max display width for DISPLAY_SUBTITLE |
+| MIN_CHUNK_DISPLAY_MS | 1000 ms | Minimum display time for non-ELRC chunks |
+| DEFAULT_LAST_LINE_MS | 5000 ms | Assumed duration of last synced line when track duration unknown |
+| BROWSE_KARAOKE_WINDOW_MS | 600 ms | Karaoke bracket look-ahead for browse tree |
+| TITLE_KARAOKE_WINDOW_MS | 300 ms | Karaoke bracket look-ahead for now-playing title |
+
+Width calculation: 1 unit per Latin character, 2 per fullwidth/CJK character. Karaoke brackets 【】 count as 2 each.
+
+Architecture:
+- CardText(lyricTitle, subtitle) holds the computed text for the now-playing card
+- getCardText(state) delegates to getLyricCardText() for active lyrics, or returns status text for intro/loading/error states
+- getLyricCardText(state) handles chunking logic: find active line, chunk to TITLE_MAX_WIDTH with karaoke brackets if ELRC, select chunk by word time or proportion
+- uildBaseMetadata(state, lyricTitle) sets DISPLAY_TITLE to lyricTitle when provided, else "Title — Artist"
+- Separate karaoke caches: rowseKaraoke (600ms window) for browse tree, 
+owPlayingKaraoke (300ms window) for now-playing
+- ChunkHold prevents flicker on estimated (non-ELRC) chunk changes
+
 ## GitHub Actions
 
 `.github/workflows/build.yml` runs on pull requests to `main`, pushes to `main`, `v*` tags, and manual `workflow_dispatch`.

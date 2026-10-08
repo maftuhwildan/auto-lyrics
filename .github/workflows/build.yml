@@ -72,7 +72,7 @@ jobs:
             fi
           fi
 
-      - name: Validate PetitLyrics release configuration
+      - name: Configure optional PetitLyrics release provider
         if: env.IS_RELEASE == 'true'
         shell: bash
         run: |
@@ -87,8 +87,27 @@ jobs:
             fi
           done
           if (( ${#missing[@]} > 0 )); then
-            echo "Missing required PetitLyrics release secrets: ${missing[*]}" >&2
-            exit 1
+            # Treat the credentials as an all-or-none set. Blank every value so
+            # a partially configured release cannot accidentally enable a
+            # broken provider in the APK.
+            for name in \
+              PETITLYRICS_USER_ID \
+              PETITLYRICS_APP_NAME \
+              PETITLYRICS_PKG_NAME \
+              PETITLYRICS_CLIENT_APP_ID; do
+              echo "$name=" >> "$GITHUB_ENV"
+            done
+            echo "::notice title=Optional provider disabled::PetitLyrics is disabled for this release because one or more optional credentials are not configured."
+            {
+              echo "### PetitLyrics provider disabled"
+              echo "This release will continue without PetitLyrics because its optional credentials are incomplete. Other lyric providers are unaffected."
+              echo "Missing configuration keys: ${missing[*]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### PetitLyrics provider enabled"
+              echo "All four optional credentials are configured; PetitLyrics will be included in this release build."
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Run unit tests

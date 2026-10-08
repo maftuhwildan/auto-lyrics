@@ -38,9 +38,9 @@ For the main-commit path, `softprops/action-gh-release` creates the unused tag d
 
 For the tag path, the workflow validates that the pushed tag exactly matches `v${versionName}`.
 
-## Required GitHub Actions secrets
+## Optional GitHub Actions secrets
 
-Release builds require these repository secrets:
+PetitLyrics is optional for release builds. Configure all four repository secrets to enable it:
 
 ```text
 PETITLYRICS_USER_ID
@@ -49,7 +49,7 @@ PETITLYRICS_PKG_NAME
 PETITLYRICS_CLIENT_APP_ID
 ```
 
-The workflow validates all four before building a release APK.
+When all four values are present, the workflow includes them in the release APK and reports that PetitLyrics is enabled in the job summary. If any value is missing, the workflow clears the entire set, reports that PetitLyrics is disabled in the job summary and workflow notice, then continues building and publishing the release without that provider. It does not print secret values.
 
 PR and ordinary `main` builds intentionally do not receive these values. Those CI artifacts build with PetitLyrics disabled unless another non-secret fallback is explicitly present in the checkout.
 
@@ -105,7 +105,7 @@ The release job should:
 
 1. read `versionName`,
 2. validate tag/version consistency and reject tag reuse,
-3. validate PetitLyrics release secrets,
+3. enable PetitLyrics only when all four optional secrets are configured (otherwise report that it is disabled and continue),
 4. run unit tests,
 5. run lint,
 6. build the minified release APK,
@@ -154,7 +154,7 @@ For either release trigger, the Linux `build` job performs:
 2. JDK 17 / Gradle setup,
 3. read `versionName`,
 4. validate tag/version consistency and reject tag reuse for the main-commit path,
-5. inject and validate PetitLyrics release configuration,
+5. configure the optional PetitLyrics provider when all four secrets are present, otherwise report it disabled and continue,
 6. `testDebugUnitTest`,
 7. `lintDebug`,
 8. `assembleRelease`,
@@ -181,7 +181,7 @@ Open the new GitHub Release and verify all of the following:
 - attached file is `auto-lyrics-X.Y.Z.apk`,
 - release is not draft/prerelease unless intentionally requested,
 - Actions run completed successfully,
-- `Validate PetitLyrics release configuration` passed,
+- the job summary confirms whether PetitLyrics was enabled or disabled as intended,
 - unit tests passed,
 - lint passed,
 - release APK build passed,
